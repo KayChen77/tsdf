@@ -1,0 +1,234 @@
+#include <fstream>
+#include <iostream>
+#include <pcl/io/pcd_io.h>
+#include <algorithm>
+#include <Eigen/Core>
+#include <Eigen/SVD>
+#include <Eigen/Cholesky>
+#include <Eigen/Geometry>
+#include <Eigen/LU>
+#include <boost/bind.hpp>
+#include <boost/thread.hpp>
+#include <opencv2/opencv.hpp>
+#include <boost/filesystem.hpp>
+#include "EvoRec.h"
+
+
+EvoRec::EvoRec(TsdfVolume& _tsdfV, ColorVolume& _colorV, const int _width, const int _height,
+	const float _depthThres,  bool _doVoxelFilter)
+	: tsdfV(_tsdfV), 
+	colorV(_colorV), 
+	width(_width), 
+	height(_height), 
+	depthThres(_depthThres), 
+	doVoxelFilter(_doVoxelFilter)
+{
+
+	cloudRec = new pcl::PointCloud<pcl::PointXYZRGB>();
+	cloudRecFiltered = new pcl::PointCloud<pcl::PointXYZRGB>();
+
+	depthData = new unsigned short[width*height];
+	imageData = new PixelRGB[width*height];
+
+	depthRawScaled_.create(height, width);
+	depthRaw_.create(height, width);
+	color_.create(height, width);
+}
+
+EvoRec::~EvoRec()
+{
+}
+
+void EvoRec::setDepthThreshold(const float _depthThres)
+{
+	depthThres = _depthThres;
+}
+
+
+
+
+// process single key frame
+void EvoRec::processKeyFrame(std::string depthFile, std::string colorFile, const FrameInfo& frameInfo)
+{
+        Intr intr = Intr(366.996, 366.996, 256.466, 209.012);
+	std::ifstream inDepth(depthFile.c_str(),std::ios::binary);
+	std::ifstream inColor(colorFile.c_str(),std::ios::binary);
+	float* idepth = new float[width*height];
+	float* imageRGB = new float[width*height * 3];
+
+	inDepth.read((char*)idepth, sizeof(float)* width * height);
+	inColor.read((char*)imageRGB, sizeof(float)* width * height * 3);
+
+
+	//float scale = frameInfo.scale;
+	// filter data and convert from float to unsigned short and pixelrgb
+        
+	for (int v = 0; v < height; v++)
+	{
+		for (int u = 0; u < width; u++)
+		{
+                        
+			int idx = u + v * width;
+			// filter some invalid points
+			//float depth = scale / idepth[idx];
+			float depth =  idepth[idx];
+			if (depth > depthThres || depth > MAX_DEPTH
+				 || depth < 0)
+			{
+				depthData[idx] = 0;
+				imageData[idx].r = 0;
+				imageData[idx].g = 0;
+				imageData[idx].b = 0;
+				continue;
+			}
+
+			// convert from float to short
+			depthData[idx] = (unsigned short)depth;
+			// convert from float to unsigned char
+			imageData[idx].r = (unsigned char)imageRGB[3 * idx];
+			imageData[idx].g = (unsigned char)imageRGB[3 * idx + 1];
+			imageData[idx].b = (unsigned char)imageRGB[3 * idx + 2];
+		}
+	}
+
+	// upload cpu data to gpu memory
+	depthRaw_.upload(depthData, width*2, height, width);
+	color_.upload(imageData, width*3, height, width);
+
+	// convert from column major (default) to row major 
+	Eigen::Matrix<float, 3, 3, Eigen::RowMajor> rotMatrix;
+	for (int ix = 0; ix < 3; ix++)
+	{
+		for (int iy = 0; iy < 3; iy++)
+		{
+			rotMatrix(ix, iy) = frameInfo.rotMatUnscaled(ix, iy);
+		}
+	}
+	Eigen::Matrix<float, 3, 3, Eigen::RowMajor> rotMatrixInverse = rotMatrix.inverse();
+	Eigen::Vector3f transVec;
+	for (int ix = 0; ix < 3; ix++)
+		transVec(ix) = frameInfo.transVec(ix);
+
+	float3 device_volume_size = device_cast<const float3>(tsdfV.getSize());
+	Mat33&  device_Rcam = device_cast<Mat33> (rotMatrix);
+	float3& device_tcam = device_cast<float3>(transVec);
+	Mat33&   device_Rcam_inv = device_cast<Mat33> (rotMatrixInverse);
+
+	// static tsdf volume
+	int3 emptyVoxel;
+	emptyVoxel.x = 0;
+	emptyVoxel.y = 0;
+	emptyVoxel.z = 0;
+
+	
+
+	// aggregate information to tsdf data
+	printf("aggregating information to tsdf volume ... \n");
+
+	integrateTsdfVolume(depthRaw_,
+		intr, 
+		device_volume_size,
+		device_Rcam_inv,
+		device_tcam,
+		tsdfV.getTsdfTruncDist(),
+		tsdfV.data(),
+		depthRawScaled_,
+		emptyVoxel,
+		colorV.data(),
+		color_);
+
+	
+
+	printf("extracting point cloud ... \n");
+	// extract and update the reconstructed point cloud
+	const Eigen::Vector3i volumeSize = tsdfV.getResolution();
+	cloud_buffer_ = tsdfV.fetchCloud(cloud_device_,
+		emptyVoxel,
+		colorV.data(),
+		0, volumeSize(0),
+		0, volumeSize(1),
+		0, volumeSize(2),
+		emptyVoxel);
+
+	printf("downloading to cpu data ... \n");
+	cloud_buffer_.download(cloudRec->points);
+
+	printf("KF processed ... \n ");
+        pcl::io::savePCDFile ("tsdf_cloud.pcd", cloudRec);
+
+	inDepth.close();
+	inColor.close();
+	delete idepth;
+	delete imageRGB;
+}
+
+
+
+void EvoRec::generatePointCloud(std::string depthFile, std::string colorFile, const FrameInfo& frameInfo)
+{
+	pcl::PointCloud<pcl::PointXYZRGB> tmpPointCloud;
+	std::vector<pcl::PointXYZRGB> tmpPointXYZRGB;
+	tmpPointXYZRGB.clear();
+	//float scale = frameInfo.scale;
+	Eigen::Vector3f transVec = frameInfo.transVec;
+	Eigen::Matrix3f rotMat = frameInfo.rotMatUnscaled;
+
+        std::ifstream inDepth(depthFile.c_str(),std::ios::binary);
+	std::ifstream inColor(colorFile.c_str(),std::ios::binary);
+	float* idepth = new float[width*height];
+	float* imageRGB = new float[width*height * 3];
+
+	inDepth.read((char*)idepth, sizeof(float)* width * height);
+	inColor.read((char*)imageRGB, sizeof(float)* width * height * 3);
+	// cloudOutput.width = width;
+	// cloudOutput.height = height;
+
+	// cloudOutput.points.resize(width * height);
+	int validNum = 0;
+	for (int y = 0; y < height; y++)
+	{
+		for (int x = 0; x < width; x++)
+		{
+			int idx = x + y * width;
+			// filter some invalid points
+			float depth =  idepth[idx];
+			if (depth > depthThres || depth > MAX_DEPTH || depth < 0)
+				continue;
+
+			float theta = 2.0f*x*M_PI / width;
+			theta = 2.0f * M_PI - theta;
+			float phi = 1.0f*y*M_PI / height;
+			pcl::PointXYZRGB pointIntoVec;
+			float xtmp = cosf(theta) * sinf(phi) * depth;
+			float ytmp = sinf(theta) * sinf(phi) * depth;
+			float ztmp = cosf(phi) * depth;
+			Eigen::Vector3f pointCam(xtmp, ytmp, ztmp);
+			Eigen::Vector3f pointWorld = rotMat * pointCam + transVec;
+
+			pointIntoVec.x = pointWorld(0);
+			pointIntoVec.y = pointWorld(1);
+			pointIntoVec.z = pointWorld(2);
+			pointIntoVec.b = imageRGB[3 * idx];
+			pointIntoVec.g = imageRGB[3 * idx + 1];
+			pointIntoVec.r = imageRGB[3 * idx + 2];
+			tmpPointXYZRGB.push_back(pointIntoVec);
+			validNum++;
+		}
+	}
+        pcl::PointCloud<pcl::PointXYZRGB> cloudOutput;
+        //cloudOutput = new pcl::PointCloud<pcl::PointXYZRGB>();
+	cloudOutput.width = validNum;
+	cloudOutput.height = 1;
+	cloudOutput.points.resize(validNum);
+	for (int i = 0; i < validNum; i++)
+	{
+		cloudOutput.points[i] = tmpPointXYZRGB[i];
+	}
+        pcl::io::savePCDFile ("raw_cloud.pcd", cloudOutput);
+        
+	inDepth.close();
+	inColor.close();
+	delete idepth;
+	delete imageRGB;
+}
+

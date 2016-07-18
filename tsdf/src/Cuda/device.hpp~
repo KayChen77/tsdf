@@ -1,0 +1,41 @@
+// under review by hwb, 3.4.2016
+// 
+#ifndef DEVICE_HPP_
+#define DEVICE_HPP_
+
+#include "internal.h"
+#include "vector_math.hpp"
+#include "limits.hpp"
+#include "/containers/device_array_impl.hpp"
+#include "/containers/device_array.hpp"
+__device__ __forceinline__ void
+clear_voxel(uchar4 & value)
+{
+    value = make_uchar4(0, 0, 0, 0);
+}
+
+__device__ __forceinline__ void
+clear_voxel(short & value)
+{
+    value = max(-DIVISOR, min(DIVISOR, __float2int_rz(0 * DIVISOR)));
+}
+
+__device__ __forceinline__ void
+pack_tsdf (float tsdf, short & value)
+{
+  value = max(-DIVISOR, min(DIVISOR, __float2int_rz(tsdf * DIVISOR)));
+}
+
+__device__ __forceinline__ float
+unpack_tsdf (short value)
+{
+  return static_cast<float>(value) / DIVISOR;    //*/ * INV_DIV;
+}
+
+template <class T>
+__device__ __host__ __forceinline__ void swap ( T& a, T& b )
+{
+  T c(a); a=b; b=c;
+}
+
+#endif /* DEVICE_HPP_ */

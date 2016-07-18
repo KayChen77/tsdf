@@ -1,0 +1,197 @@
+// reviewed by hwb, 3.3.2016
+ 
+/*#include "Volume.h"*/
+#include <stdio.h>
+#include <algorithm>
+#include <Eigen/Core>
+#include "TSDFVolume.h"
+
+TsdfVolume::TsdfVolume(const Eigen::Vector3i& resolution, const Eigen::Vector3f& volumeSize)
+: resolution_(resolution)
+{
+	int volume_x = resolution_(0);
+	int volume_y = resolution_(1);
+	int volume_z = resolution_(2);
+
+	// only cubic type volume is allowed
+	assert(volume_x == volume_y && volume_y == volume_z);
+
+	// create data buffer in gpu
+	volume_.create(volume_y * volume_z, volume_x);
+
+	const float    default_tranc_dist = 0.03f; //meters
+
+	setSize(volumeSize);
+	setTsdfTruncDist(default_tranc_dist);
+
+	// call cuda function to initialize the volume_ buffer
+	initVolume(volume_);
+
+	// reset all variables
+	reset();
+}
+
+void TsdfVolume::setSize(const Eigen::Vector3f& size)
+{  
+    size_ = size;
+    setTsdfTruncDist(tranc_dist_);
+}
+
+void TsdfVolume::setTsdfTruncDist (float distance)
+{
+    float cx = size_(0) / resolution_(0);
+    float cy = size_(1) / resolution_(1);
+    float cz = size_(2) / resolution_(2);
+
+	// bound the truncdist to at least 2 voxels
+    tranc_dist_ = std::max (distance, 2.1f * std::max (cx, std::max (cy, cz)));
+}
+
+DeviceArray2D<short> TsdfVolume::data() const
+{
+    return volume_;
+}
+
+const Eigen::Vector3f& TsdfVolume::getSize() const
+{
+    return size_;
+}
+
+const Eigen::Vector3i& TsdfVolume::getResolution() const
+{
+    return resolution_;
+}
+
+const Eigen::Vector3f TsdfVolume::getVoxelSize() const
+{    
+    return size_.array () / resolution_.array().cast<float>();
+}
+
+
+float TsdfVolume::getTsdfTruncDist () const
+{
+    return tranc_dist_;
+}
+
+void TsdfVolume::reset()
+{
+    initVolume(volume_);
+}
+
+// convert tsdf volume stocked in volume_ and color information stocked in color_volume to a point cloud buffer
+DeviceArray<pcl::PointXYZRGB> TsdfVolume::fetchCloud(DeviceArray<pcl::PointXYZRGB> & cloud_buffer,
+                                 int3 & voxelWrap,
+                                 PtrStep<uchar4> color_volume,
+                                 int minX,
+                                 int maxX,
+                                 int minY,
+                                 int maxY,
+                                 int minZ,
+                                 int maxZ,
+                                 int3 realVoxelWrap,
+                                 int subsample) const
+{
+    if(cloud_buffer.empty())
+    {
+        cloud_buffer.create (DEFAULT_CLOUD_BUFFER_SIZE);
+    }
+
+    float3 device_volume_size = device_cast<const float3>(size_);
+
+    size_t size = extractCloudSlice(volume_,
+                                    device_volume_size,
+                                    cloud_buffer,
+                                    voxelWrap,
+                                    color_volume,
+                                    minX,
+                                    maxX,
+                                    minY,
+                                    maxY,
+                                    minZ,
+                                    maxZ,
+                                    subsample,
+                                    realVoxelWrap);
+
+    DeviceArray<pcl::PointXYZRGB> newBuffer(cloud_buffer.ptr(), size);
+
+    return newBuffer;
+}
+
+void TsdfVolume::downloadTsdf (std::vector<float>& tsdf) const
+{
+    tsdf.resize (volume_.cols() * volume_.rows());
+    volume_.download(&tsdf[0], volume_.cols() * sizeof(int));
+
+    for(int i = 0; i < (int) tsdf.size(); ++i)
+    {
+        float tmp = reinterpret_cast<short2*>(&tsdf[i])->x;
+        tsdf[i] = tmp/DIVISOR;
+    }
+}
+
+void TsdfVolume::downloadTsdfAndWeighs (std::vector<float>& tsdf, std::vector<short>& weights) const
+{
+    int volumeSize = volume_.cols() * volume_.rows();
+    tsdf.resize (volumeSize);
+    weights.resize (volumeSize);
+    volume_.download(&tsdf[0], volume_.cols() * sizeof(int));
+
+    for(int i = 0; i < (int) tsdf.size(); ++i)
+    {
+        short2 elem = *reinterpret_cast<short2*>(&tsdf[i]);
+        tsdf[i] = (float)(elem.x)/DIVISOR;
+        weights[i] = (short)(elem.y);
+    }
+}
+
+void TsdfVolume::saveTsdfToDisk(std::string filename) const
+{
+    std::vector<float> tsdf;
+    std::vector<short> weights;
+
+    downloadTsdfAndWeighs(tsdf, weights);
+
+    std::string tsdfName = filename;
+    tsdfName += "_tsdf.bin";
+
+    FILE * fp = fopen(tsdfName.c_str(), "wb+");
+
+    fwrite(&tsdf[0], sizeof(float) * tsdf.size(), 1, fp);
+
+    fclose(fp);
+
+    std::string weightName = filename;
+    weightName += "_weight.bin";
+
+    fp = fopen(weightName.c_str(), "wb+");
+
+    fwrite(&weights[0], sizeof(short) * weights.size(), 1, fp);
+
+    fclose(fp);
+}
+
+// TsdfVolume::TsdfVolume(const Eigen::Vector3i& resolution)
+//  : resolution_(resolution)
+// {
+//     int volume_x = resolution_(0);
+//     int volume_y = resolution_(1);
+//     int volume_z = resolution_(2);
+// 
+// 	// only cubic type volume is allowed
+//     assert(volume_x == volume_y && volume_y == volume_z);
+// 
+// 	// create data buffer in gpu
+//     volume_.create (volume_y * volume_z, volume_x);
+// 
+//     const Eigen::Vector3f default_volume_size = Eigen::Vector3f::Constant (Volume::get().getVolumeSize()); //meters
+//     const float    default_tranc_dist  = 0.03f; //meters
+// 
+//     setSize(default_volume_size);
+//     setTsdfTruncDist(default_tranc_dist);
+// 
+// 	// call cuda function to initialize the volume_ buffer
+//     initVolume(volume_);
+// 
+// 	// reset all variables
+//     reset();
+// }

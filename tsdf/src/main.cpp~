@@ -1,0 +1,29 @@
+#include <iostream>
+#include <fstream>
+#include <cv.h>
+#include <highgui.h>
+#include <dirent.h>
+#include <string.h>
+#include "EvoRec.h"
+#include "./DepthMap/DenseMap.h"
+ 
+int main (int argc, char** argv) 
+{
+	const Eigen::Vector3i resolution = Eigen::Vector3i(512, 512, 512);
+	const Eigen::Vector3f volumeSize = Eigen::Vector3f(3.0f, 3.0f, 3.0f);
+	int width = 480;
+	int height = 240;
+	float depthThres = 2.0f;
+	bool doVoxelFilter = false;
+
+	TsdfVolume tsdfV(resolution, volumeSize);
+	ColorVolume colorV(tsdfV);
+	EvoRec evoRec(tsdfV, colorV, width, height, depthThres, doVoxelFilter);
+	
+	// begins process evoslam data
+	FrameInfo Kf;
+	Kf.rotMatUnscaled << 1, 1, 1, 1, 1, 1, 1, 1, 1;
+	Kf.transVec  = Eigen::Vector3f(0,0,0);
+	//evoRec.processKeyFrame("/test_TSDF/registered_1_1.jpg","/test_TSDF/undistorted_1_1.jpg", Kf);
+        evoRec.generatePointCloud("/test_TSDF/registered_1_1.jpg","/test_TSDF/undistorted_1_1.jpg", Kf);
+}
